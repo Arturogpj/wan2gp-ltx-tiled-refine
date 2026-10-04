@@ -9,17 +9,29 @@ WanGP runs the whole frame in one call, which puts the LoRA outside its training
 This module ports ``TiledDiffusionModel`` / ``VideoModalityTilingHelper`` onto WanGP's LTX-2
 code (no WanGP file is edited). At plugin load it wraps, in ``models.ltx2``:
 
-- ``LTX2.generate``: when a tiled detail IC-LoRA is selected with an IC-LoRA control video,
-  force a single full-resolution stage (two stages would refine a half-size canvas).
-- ``ltx_pipelines.distilled.denoise_audio_video``: remember the canvas size of the stage.
+- ``LTX2.generate``: activates when a tiled detail IC-LoRA is selected with an IC-LoRA control video.
+- ``ltx_pipelines.distilled.denoise_audio_video``: remember the canvas size and phase of the stage.
 - ``ltx_pipelines.distilled.simple_denoising_func``: hand it a transformer wrapper that tiles
   every call. Each window keeps its generated tokens plus the IC-LoRA guide tokens that
   overlap it (same positions, downscale factor 1), gets positions shifted to start at zero and
   its own runtime cache, sees the full audio stream, and is blended with trapezoidal weights
   (guide tokens and audio are averaged), as in Lightricks' code.
+- ``ltx_pipelines.utils.helpers`` control-video loading/encoding: low-VRAM path (below).
+
+With 2 Phases, phase 1 is a half-size draft. When that draft is at most 1.6x the trained window
+(2560x1408 -> 1280x704), it runs as one window instead of 2-4 heavily overlapping ones.
+
+Settings are chosen in the WanGP UI (dropdowns under Phases) and saved to ``config.json``:
+- ``tiles``: ``quality`` (windows overlap by half, Lightricks' default; 9 windows at 1920x1088),
+  ``balanced`` (>= 128 px overlap; 6 at 1080p) or ``fast`` (>= 32 px; 4 at 1080p, thinnest seams).
+- ``phase1_single_window``: the one-window phase 1 draft above (default on).
+- ``low_vram_control_video``: build the IC-LoRA / control clip in system RAM in 16-bit and send it to the
+  VAE one tile at a time, instead of holding it on the GPU in float32 (applies to every LTX control video).
+A timing line is printed after each detail render.
 """
 
 import dataclasses
+import json
 import math
 import os
 import threading
@@ -27,13 +39,36 @@ import threading
 import torch
 
 TILED_LORA_PATTERNS = ("ic-lora-refine-details", "ic-lora-restore")
+FORCE_ONE_PHASE = False  # True: always run one full-resolution phase
 TILE_LONG, TILE_SHORT = 1024, 576  # the LoRAs' trained window, in pixels
 SPATIAL_SCALE, TEMPORAL_SCALE = 32, 8  # LTX-2 video VAE
 LOG = "[LTX Tiled Refine]"
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+# Minimum overlap between neighbouring windows, in latent cells (32 px). 1920x1088: quality 9, balanced 6, fast 4 windows.
+TILE_MODES = {"quality": None, "balanced": 4, "fast": 1}  # None = at least half a window (Lightricks' default)
+CONTROL_CHUNK_FRAMES = 16
+# Phase 1 of 2 Phases is the low-res draft (half the final size). When it is at most this many trained windows
+# in area (2K: 1280x704 = 1.53), one pass over the whole draft replaces 2-4 heavily overlapping windows.
+PHASE1_SINGLE_WINDOW_MAX_AREA = 1.6
 
 _lock = threading.RLock()
 _state = threading.local()
 _patched = False
+
+
+def _load_config():
+    config = {"tiles": "quality", "low_vram_control_video": True, "phase1_single_window": True}
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as handle:
+            config.update(json.load(handle))
+    except FileNotFoundError:
+        pass
+    except Exception as error:
+        print(f"{LOG} could not read config.json ({error}); using defaults")
+    if config["tiles"] not in TILE_MODES:
+        print(f"{LOG} unknown tiles mode {config['tiles']!r}; using 'quality' (choices: {', '.join(TILE_MODES)})")
+        config["tiles"] = "quality"
+    return config
 
 
 def _tiled_lora(loras_selected):
@@ -44,11 +79,13 @@ def _tiled_lora(loras_selected):
     return None
 
 
-def _axis_tiles(length, size):
-    """Fixed-size windows with at least 50% overlap; first and last pinned to the canvas edges."""
+def _axis_tiles(length, size, min_overlap=None):
+    """Fixed-size windows overlapping by at least ``min_overlap`` cells (default: half a window);
+    first and last pinned to the canvas edges, the rest spread evenly."""
     if length <= size:
         return [(0, length)]
-    step = size - size // 2
+    min_overlap = size // 2 if min_overlap is None else max(1, min(int(min_overlap), size // 2))
+    step = size - min_overlap
     count = math.ceil((length - size) / step) + 1
     return [(round(index * (length - size) / (count - 1)), size) for index in range(count)]
 
@@ -75,10 +112,11 @@ class TiledRefineTransformer:
     """Stands in for the X0 transformer inside ``simple_denoising_func``; everything but the
     call is forwarded to the wrapped transformer (LoRA step, preprocessors, ...)."""
 
-    def __init__(self, module, frames, height, width, tile_height, tile_width):
+    def __init__(self, module, frames, height, width, tile_height, tile_width, min_overlap=None):
         self._module = module
         self._frames, self._height, self._width = frames, height, width
-        rows, cols = _axis_tiles(height, tile_height), _axis_tiles(width, tile_width)
+        rows, cols = _axis_tiles(height, tile_height, min_overlap), _axis_tiles(width, tile_width, min_overlap)
+        self.min_overlap_px = min([start + size - nxt for axis in (rows, cols) for (start, size), (nxt, _) in zip(axis, axis[1:])] or [0]) * SPATIAL_SCALE
         row_weights, col_weights = _axis_weights(rows), _axis_weights(cols)
         self._tiles = [(row, col, row_weight[:, None] * col_weight[None, :])
                        for row, row_weight in zip(rows, row_weights) for col, col_weight in zip(cols, col_weights)]
@@ -189,17 +227,123 @@ class TiledRefineTransformer:
         return results_video[0], results_audio[0]
 
 
+def _timed(label, function):
+    """Stopwatch for one pipeline job while a detail-LoRA render runs; totals are printed at the end."""
+    import time
+
+    def wrapper(*args, **kwargs):
+        timings = getattr(_state, "timings", None)
+        if timings is None:
+            return function(*args, **kwargs)
+        start = time.perf_counter()
+        try:
+            return function(*args, **kwargs)
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            timings.append((label, time.perf_counter() - start))
+    return wrapper
+
+
+def _print_timings(total):
+    timings = getattr(_state, "timings", None) or []
+    merged = {}
+    phase = 0
+    for label, seconds in timings:
+        if label == "denoise":
+            phase += 1
+            label = f"phase {phase} denoising"
+        merged[label] = merged.get(label, 0.0) + seconds
+    other = total - sum(merged.values())
+    parts = [f"{label} {seconds:.0f}s" for label, seconds in merged.items()] + [f"other {other:.0f}s"]
+    print(f"{LOG} timing: total {total:.0f}s = " + " | ".join(parts))
+
+
+def _load_control_video_cpu(video_path, height, width, frame_cap, dtype, device):
+    """Same pixels as media_io.load_video_conditioning, but built 16 frames at a time and kept in system RAM
+    in the target dtype. WanGP's version holds the whole clip on the GPU in float32 (plus a temporary copy),
+    which is ~6.75 GiB for 289 frames at 1920x1088 and ran out of memory before the second phase."""
+    from models.ltx2.ltx_pipelines.utils import media_io
+
+    def prepared(chunk):
+        chunk = media_io.resize_and_center_crop(chunk.to(device=device, dtype=torch.float32), height, width)
+        return media_io.normalize_latent(chunk, device, dtype).to("cpu")
+
+    parts = []
+    if isinstance(video_path, str):
+        parts = [prepared(frame) for frame in media_io.decode_video_from_file(path=video_path, frame_cap=frame_cap, device="cpu")]
+    else:
+        video = video_path
+        if not torch.is_tensor(video) or video.ndim != 4:
+            video = media_io._coerce_video_input(video)
+        video = media_io._normalize_video_tensor(video)
+        if frame_cap is not None and video.shape[0] > frame_cap:
+            video = video[:frame_cap]
+        # _scale_to_255 decides from the whole clip's range, so take it once and apply the same rule per chunk
+        low, high = (float(video.min()), float(video.max())) if torch.is_floating_point(video) else (0.0, 255.0)
+        for start in range(0, video.shape[0], CONTROL_CHUNK_FRAMES):
+            chunk = video[start:start + CONTROL_CHUNK_FRAMES].to(torch.float32)
+            if torch.is_floating_point(video) and high <= 1.0 and low >= -1.0:
+                chunk = (chunk + 1.0) * 127.5
+            elif torch.is_floating_point(video) and high <= 1.0 and low >= 0.0:
+                chunk = chunk * 255.0
+            parts.append(prepared(chunk))
+    return torch.cat(parts, dim=2) if parts else None
+
+
+class _InputToDevice:
+    """Encoder proxy: VAE tiles sliced from a system-RAM clip are moved to the GPU one at a time."""
+
+    def __init__(self, encoder, device):
+        self._encoder, self._device = encoder, device
+
+    def __getattr__(self, name):
+        return getattr(self._encoder, name)
+
+    def __call__(self, tile, *args, **kwargs):
+        return self._encoder(tile.to(self._device, non_blocking=True), *args, **kwargs)
+
+
 def apply_patches():
     global _patched
     with _lock:
         if _patched:
             return
         from models.ltx2 import ltx2 as ltx2_module
-        from models.ltx2.ltx_pipelines import distilled
+        from models.ltx2.ltx_pipelines import distilled, ti2vid_two_stages
+        from models.ltx2.ltx_pipelines.utils import helpers
 
         original_generate = ltx2_module.LTX2.generate
         original_denoise = distilled.denoise_audio_video
         original_denoising_func = distilled.simple_denoising_func
+        original_control_video = helpers.video_conditionings_by_control_video
+        original_load_video = helpers.load_video_conditioning
+        original_encode = helpers.vae_encode_video
+
+        def video_conditionings_by_control_video(*args, **kwargs):
+            # Every LTX control/IC-LoRA guide clip passes here; only inside it is the clip built in system RAM.
+            if not _load_config().get("low_vram_control_video", True):
+                return original_control_video(*args, **kwargs)
+            _state.control_device = kwargs.get("device")
+            try:
+                return original_control_video(*args, **kwargs)
+            finally:
+                _state.control_device = None
+
+        def load_video_conditioning(*args, **kwargs):
+            device = getattr(_state, "control_device", None)
+            if device is None or args or torch.device(device).type != "cuda":
+                return original_load_video(*args, **kwargs)
+            return _load_control_video_cpu(kwargs["video_path"], kwargs["height"], kwargs["width"], kwargs.get("frame_cap"),
+                                           kwargs["dtype"], device)
+
+        def vae_encode_video(video, video_encoder, tiling_config=None):
+            device = getattr(_state, "control_device", None)
+            if device is None or video.device.type != "cpu":
+                return original_encode(video, video_encoder, tiling_config)
+            if tiling_config is None or (tiling_config.spatial_config is None and tiling_config.temporal_config is None):
+                return original_encode(video.to(device), video_encoder, tiling_config)
+            return original_encode(video, _InputToDevice(video_encoder, device), tiling_config)
 
         def generate(self, *args, **kwargs):
             lora = _tiled_lora(kwargs.get("loras_selected"))
@@ -207,19 +351,32 @@ def apply_patches():
             if args or lora is None or not ("V" in video_prompt_type and "G" in video_prompt_type) or kwargs.get("input_frames") is None:
                 return original_generate(self, *args, **kwargs)
             if int(kwargs.get("guide_phases", 1) or 1) != 1:
-                print(f"{LOG} {lora} runs as one full-resolution stage; switching Phases to 1")
-                kwargs["guide_phases"] = 1
+                if FORCE_ONE_PHASE:
+                    print(f"{LOG} {lora} runs as one full-resolution stage; switching Phases to 1")
+                    kwargs["guide_phases"] = 1
+                else:
+                    print(f"{LOG} {lora} with {kwargs.get('guide_phases')} Phases: stages above 1024x576 are tiled")
+            import time
+
             _state.active = True
+            _state.config = _load_config()
+            _state.timings = []
+            _state.phase = 0
+            _state.guide_phases = int(kwargs.get("guide_phases", 1) or 1)
+            start = time.perf_counter()
             try:
                 return original_generate(self, *args, **kwargs)
             finally:
+                _print_timings(time.perf_counter() - start)
                 _state.active = False
                 _state.shape = None
+                _state.timings = None
 
         def denoise_audio_video(*args, **kwargs):
             if not getattr(_state, "active", False):
                 return original_denoise(*args, **kwargs)
             _state.shape = kwargs.get("output_shape")
+            _state.phase = getattr(_state, "phase", 0) + 1
             try:
                 return original_denoise(*args, **kwargs)
             finally:
@@ -234,15 +391,34 @@ def apply_patches():
                 portrait = shape.height > shape.width
                 tile_height = (TILE_LONG if portrait else TILE_SHORT) // SPATIAL_SCALE
                 tile_width = (TILE_SHORT if portrait else TILE_LONG) // SPATIAL_SCALE
-                wrapped = TiledRefineTransformer(transformer, frames, height, width, tile_height, tile_width)
-                if wrapped.tile_count > 1:
+                config = getattr(_state, "config", None) or _load_config()
+                mode = config["tiles"]
+                wrapped = TiledRefineTransformer(transformer, frames, height, width, tile_height, tile_width, TILE_MODES[mode])
+                area = height * width / (tile_height * tile_width)
+                draft = getattr(_state, "guide_phases", 1) >= 2 and getattr(_state, "phase", 0) == 1
+                if wrapped.tile_count > 1 and draft and config.get("phase1_single_window", True) and area <= PHASE1_SINGLE_WINDOW_MAX_AREA:
+                    print(f"{LOG} {shape.width}x{shape.height}, {shape.frames} frames: phase 1 draft in one window "
+                          f"({area:.2f}x the trained window) instead of {wrapped.tile_count} tiles")
+                elif wrapped.tile_count > 1:
                     print(f"{LOG} {shape.width}x{shape.height}, {shape.frames} frames: {wrapped.tile_count} windows of "
-                          f"{tile_width * SPATIAL_SCALE}x{tile_height * SPATIAL_SCALE} fused every step")
+                          f"{tile_width * SPATIAL_SCALE}x{tile_height * SPATIAL_SCALE} fused every step "
+                          f"(tiles: {mode}, smallest overlap {wrapped.min_overlap_px}px)")
                     kwargs["transformer"] = wrapped
             return original_denoising_func(*args, **kwargs)
 
         ltx2_module.LTX2.generate = generate
         distilled.denoise_audio_video = denoise_audio_video
         distilled.simple_denoising_func = simple_denoising_func
+        timed_control_video = _timed("clip encoding", video_conditionings_by_control_video)
+        for module in (helpers, distilled, ti2vid_two_stages):
+            module.video_conditionings_by_control_video = timed_control_video
+        distilled.denoise_audio_video = _timed("denoise", denoise_audio_video)
+        distilled.upsample_video = _timed("phase 1->2 upscale", distilled.upsample_video)
+        distilled.vae_decode_video_to_tensor = _timed("video decoding", distilled.vae_decode_video_to_tensor)
+        distilled.vae_decode_audio = _timed("audio decoding", distilled.vae_decode_audio)
+        helpers.load_video_conditioning = load_video_conditioning
+        helpers.vae_encode_video = vae_encode_video
         _patched = True
-        print(f"{LOG} Active: {', '.join(TILED_LORA_PATTERNS)} IC-LoRAs run on {TILE_LONG}x{TILE_SHORT} fused windows.")
+        config = _load_config()
+        print(f"{LOG} Active: {', '.join(TILED_LORA_PATTERNS)} IC-LoRAs run on {TILE_LONG}x{TILE_SHORT} fused windows "
+              f"(tiles: {config['tiles']}; low-VRAM control video: {'on' if config['low_vram_control_video'] else 'off'}).")
