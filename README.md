@@ -21,7 +21,7 @@ https://github.com/Arturogpj/wan2gp-ltx-tiled-refine
 Enable it and restart WanGP. The console shows:
 
 ```
-[LTX Tiled Refine] Active: ic-lora-refine-details, ic-lora-restore IC-LoRAs run on 1024x576 fused windows (tiles: quality; low-VRAM control video: on).
+[LTX Tiled Refine] Active: ic-lora-refine-details on 1024x576, ic-lora-restore on 960x544 fused windows (tiles: quality; low-VRAM control video: on).
 ```
 
 ## Use
@@ -40,9 +40,25 @@ Enable it and restart WanGP. The console shows:
 
 The plugin only activates when a LoRA whose file name contains `ic-lora-refine-details` or `ic-lora-restore` is selected **and** an IC-LoRA control video is used. Everything else runs as normal WanGP.
 
+### Restore (old tapes, VHS, film scans)
+
+The **Restore** IC-LoRA ([Lightricks/LTX-2.5-22b-IC-LoRA-Restore](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Restore)) cleans up archive footage: compression damage, tape and sepia casts, flicker, dirt and scratches. Download `ltx-2.5-22b-ic-lora-restore-1.0.safetensors` into WanGP's `loras/ltx2` folder. The plugin runs it on **960x544** windows, the size it was trained on (Refine Details uses 1024x576).
+
+Settings from Lightricks' model card:
+
+| Setting | Value |
+|---|---|
+| LoRA strength | **1.0** (it works like a switch; lower values stop the restoration) |
+| Phases | 1, Steps 8 |
+| Resolution | **1440 wide**: 1440x816 for 16:9 (WanGP makes it 1408x768, 4 windows), 1440x1088 for 4:3 (1408x1088, 6 windows) |
+| Sliding window | **97 frames** (it was trained on 49 and 97 frame clips) |
+| Source | deinterlace VHS / telecined footage first, but **don't denoise or sharpen** it |
+
+For more resolution, run **Restore first, then Refine Details** on the restored clip (e.g. at 2x). Lightricks notes that the other order gives emptier results.
+
 ### Plugin settings (under **Phases** in the WanGP UI)
 
-**LTX Refine Details tiles** — how much the 1024x576 windows overlap. More overlap = more windows = slower.
+**LTX Refine Details tiles** — how much the windows overlap (applies to both LoRAs; the table is for Refine Details). More overlap = more windows = slower.
 
 | Option | 1920x1088 | 2560x1408 | Notes |
 |---|---|---|---|
@@ -94,7 +110,7 @@ LTX needs sizes divisible by 64, and WanGP rounds other values (2560x1440 become
 
 Ported from Lightricks' `TiledDiffusionModel` / `VideoModalityTilingHelper`:
 
-- Windows are 1024x576 (576x1024 for portrait). The first and last windows are pinned to the frame edges, the rest spread evenly.
+- Windows are the LoRA's trained size: 1024x576 for Refine Details, 960x544 for Restore (swapped for portrait). The first and last windows are pinned to the frame edges, the rest spread evenly.
 - Each window keeps its own generated tokens plus the IC-LoRA guide tokens that overlap it. Positions are shifted to start at zero, and each window gets its own runtime cache.
 - Window outputs are blended with trapezoidal weights. Guide tokens and audio are averaged.
 
@@ -108,11 +124,12 @@ It wraps, in WanGP's `models.ltx2`:
 ## Limitations
 
 - **Distilled models only.** The Dev model uses a different WanGP pipeline that this plugin does not patch yet.
-- Tested on WanGP v13.14, one GPU (RTX 4080 Super), with the Refine Details LoRA. Restore uses the same path but is less tested.
+- Tested on WanGP v13.14, one GPU (RTX 4080 Super), with the Refine Details LoRA. Restore uses the same code with its own window size, but has had less real-world testing.
 - A WanGP update that changes these internal functions can stop the plugin from working until it is updated.
 
 ## Changelog
 
+- **1.2.0** — Restore runs on its trained 960x544 windows (was 1024x576); Restore section in the README.
 - **1.1.0** — 2 Phases supported (one-window phase 1 draft), tile presets (Quality / Balanced / Fast) in the UI, low-VRAM control video for long clips, timing line, measured speeds.
 - **1.0.0** — per-step tiled fusion, 1 Phase only.
 

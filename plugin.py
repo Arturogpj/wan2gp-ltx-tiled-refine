@@ -42,7 +42,7 @@ class LTXTiledRefinePlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "1.1.0"
+        self.version = "1.2.0"
         self.description = ("LTX-2.5 Refine Details / Restore IC-LoRAs: per-step tiled fusion on 1024x576 windows, "
                             "as in Lightricks' TiledFusion workflows.")
         self.request_component("guidance_phases")

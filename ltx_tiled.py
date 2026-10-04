@@ -1,6 +1,6 @@
 """Per-step tiled fusion for the LTX-2.5 detail IC-LoRAs (Refine Details, Restore) in WanGP.
 
-Lightricks trained these IC-LoRAs on 1024x576 windows and runs them above that size with
+Lightricks trained these IC-LoRAs on fixed windows (Refine Details 1024x576, Restore 960x544) and runs them above that size with
 per-step tiled fusion (ComfyUI ``LTXVTiledFusionSampler``; LTX-2 ``TiledDiffusionModel`` in
 ``ltx_pipelines/utils/tiled_diffusion.py``): one full-canvas latent, and at every denoising
 step the transformer runs on overlapping fixed-size windows whose predictions are blended back.
@@ -38,9 +38,11 @@ import threading
 
 import torch
 
-TILED_LORA_PATTERNS = ("ic-lora-refine-details", "ic-lora-restore")
+# Each IC-LoRA runs on the window it was trained on (model cards): Refine Details 1024x576, Restore 960x544.
+TILE_WINDOWS = {"ic-lora-refine-details": (1024, 576), "ic-lora-restore": (960, 544)}
+TILED_LORA_PATTERNS = tuple(TILE_WINDOWS)
 FORCE_ONE_PHASE = False  # True: always run one full-resolution phase
-TILE_LONG, TILE_SHORT = 1024, 576  # the LoRAs' trained window, in pixels
+TILE_LONG, TILE_SHORT = TILE_WINDOWS["ic-lora-refine-details"]  # default window, in pixels
 SPATIAL_SCALE, TEMPORAL_SCALE = 32, 8  # LTX-2 video VAE
 LOG = "[LTX Tiled Refine]"
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -359,6 +361,7 @@ def apply_patches():
             import time
 
             _state.active = True
+            _state.window = next(window for pattern, window in TILE_WINDOWS.items() if pattern in lora)
             _state.config = _load_config()
             _state.timings = []
             _state.phase = 0
@@ -371,6 +374,7 @@ def apply_patches():
                 _state.active = False
                 _state.shape = None
                 _state.timings = None
+                _state.window = None
 
         def denoise_audio_video(*args, **kwargs):
             if not getattr(_state, "active", False):
@@ -389,8 +393,9 @@ def apply_patches():
                 frames = (int(shape.frames) - 1) // TEMPORAL_SCALE + 1
                 height, width = int(shape.height) // SPATIAL_SCALE, int(shape.width) // SPATIAL_SCALE
                 portrait = shape.height > shape.width
-                tile_height = (TILE_LONG if portrait else TILE_SHORT) // SPATIAL_SCALE
-                tile_width = (TILE_SHORT if portrait else TILE_LONG) // SPATIAL_SCALE
+                tile_long, tile_short = getattr(_state, "window", None) or (TILE_LONG, TILE_SHORT)
+                tile_height = (tile_long if portrait else tile_short) // SPATIAL_SCALE
+                tile_width = (tile_short if portrait else tile_long) // SPATIAL_SCALE
                 config = getattr(_state, "config", None) or _load_config()
                 mode = config["tiles"]
                 wrapped = TiledRefineTransformer(transformer, frames, height, width, tile_height, tile_width, TILE_MODES[mode])
@@ -420,5 +425,5 @@ def apply_patches():
         helpers.vae_encode_video = vae_encode_video
         _patched = True
         config = _load_config()
-        print(f"{LOG} Active: {', '.join(TILED_LORA_PATTERNS)} IC-LoRAs run on {TILE_LONG}x{TILE_SHORT} fused windows "
+        print(f"{LOG} Active: " + ", ".join(f"{pattern} on {long}x{short}" for pattern, (long, short) in TILE_WINDOWS.items()) + " fused windows "
               f"(tiles: {config['tiles']}; low-VRAM control video: {'on' if config['low_vram_control_video'] else 'off'}).")

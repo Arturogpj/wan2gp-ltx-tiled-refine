@@ -1,11 +1,11 @@
 {
   "name": "LTX Tiled Refine",
   "author": "Arturogpj",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Runs the LTX-2.5 Refine Details / Restore IC-LoRAs on 1024x576 windows fused at every denoising step (Lightricks' tiled fusion), so they add detail above their trained size instead of blurring. Supports 2 Phases, tile presets and long clips at 1080p+.",
   "type": [
     "app"
   ],
-  "date": "2026-10-03",
+  "date": "2026-10-04",
   "wan2gp_version": ""
 }
