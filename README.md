@@ -40,9 +40,20 @@ Enable it and restart WanGP. The console shows:
 
 The plugin only activates when a LoRA whose file name contains `ic-lora-refine-details` or `ic-lora-restore` is selected **and** an IC-LoRA control video is used. Everything else runs as normal WanGP.
 
+### Ready-made presets
+
+On first start the plugin adds two presets to WanGP's LTX-2 presets list (they show up after the next restart; existing files with the same name are never overwritten):
+
+| Preset | What it does | LoRA download |
+|---|---|---|
+| **LTX Refine Details 1080p 2 Phases (Tiled Refine)** | Refine Details, 1920x1088, 2 Phases | automatic (WanGP's open mirror) |
+| **LTX Restore - archive VHS (Tiled Refine)** | Restore, ~1.57 MP keeping the clip's shape (4:3 tape -> ~1408x1088), 1 Phase, 97-frame windows | automatic **after** you accept the licence on the [Restore page](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Restore) and log in to Hugging Face on this PC (`hf auth login`). Otherwise download the file into `loras/ltx2` yourself |
+
+Pick the model **LTX-2 2.5 Distilled 22B**, load a preset, add your clip as the control video, and for Restore replace the `[describe the scene ...]` part of the prompt.
+
 ### Restore (old tapes, VHS, film scans)
 
-The **Restore** IC-LoRA ([Lightricks/LTX-2.5-22b-IC-LoRA-Restore](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Restore)) cleans up archive footage: compression damage, tape and sepia casts, flicker, dirt and scratches. Download `ltx-2.5-22b-ic-lora-restore-1.0.safetensors` into WanGP's `loras/ltx2` folder. The plugin runs it on **960x544** windows, the size it was trained on (Refine Details uses 1024x576).
+The **Restore** IC-LoRA ([Lightricks/LTX-2.5-22b-IC-LoRA-Restore](https://huggingface.co/Lightricks/LTX-2.5-22b-IC-LoRA-Restore)) cleans up archive footage: compression damage, tape and sepia casts, flicker, dirt and scratches. Use the Restore preset above, or download `ltx-2.5-22b-ic-lora-restore-1.0.safetensors` into WanGP's `loras/ltx2` folder (the Hugging Face page is gated: accept the licence first). The plugin runs it on **960x544** windows, the size it was trained on (Refine Details uses 1024x576).
 
 Settings from Lightricks' model card:
 
@@ -53,6 +64,7 @@ Settings from Lightricks' model card:
 | Resolution | **1440 wide**: 1440x816 for 16:9 (WanGP makes it 1408x768, 4 windows), 1440x1088 for 4:3 (1408x1088, 6 windows) |
 | Sliding window | **97 frames** (it was trained on 49 and 97 frame clips) |
 | Source | deinterlace VHS / telecined footage first, but **don't denoise or sharpen** it |
+| Prompt | describe the period, place, light, materials and clothing: it colourises from what you write. Keep it about the whole frame. Put things it must not invent (modern objects, logos, lettering) in the negative prompt |
 
 For more resolution, run **Restore first, then Refine Details** on the restored clip (e.g. at 2x). Lightricks notes that the other order gives emptier results.
 
@@ -129,6 +141,7 @@ It wraps, in WanGP's `models.ltx2`:
 
 ## Changelog
 
+- **1.3.0** — ready-made Refine Details and Restore presets, installed into WanGP on first start.
 - **1.2.0** — Restore runs on its trained 960x544 windows (was 1024x576); Restore section in the README.
 - **1.1.0** — 2 Phases supported (one-window phase 1 draft), tile presets (Quality / Balanced / Fast) in the UI, low-VRAM control video for long clips, timing line, measured speeds.
 - **1.0.0** — per-step tiled fusion, 1 Phase only.

@@ -1,4 +1,6 @@
 import json
+import os
+import shutil
 import traceback
 
 import gradio as gr
@@ -42,15 +44,37 @@ class LTXTiledRefinePlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "1.2.0"
+        self.version = "1.3.0"
         self.description = ("LTX-2.5 Refine Details / Restore IC-LoRAs: per-step tiled fusion on 1024x576 windows, "
                             "as in Lightricks' TiledFusion workflows.")
         self.request_component("guidance_phases")
+        self.request_global("get_lora_dir")
 
     def setup_ui(self):
         apply_patches()
 
+    def _install_presets(self):
+        """Copy the bundled presets into WanGP's LTX-2 LoRA folder once; never overwrite a user's copy."""
+        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "presets")
+        if not os.path.isdir(source):
+            return
+        try:
+            get_lora_dir = getattr(self, "get_lora_dir", None)
+            target = get_lora_dir("ltx2_25_22B_distilled") if callable(get_lora_dir) else os.path.join("loras", "ltx2")
+        except Exception:
+            target = os.path.join("loras", "ltx2")
+        os.makedirs(target, exist_ok=True)
+        for name in sorted(os.listdir(source)):
+            destination = os.path.join(target, name)
+            if name.endswith(".json") and not os.path.exists(destination):
+                shutil.copyfile(os.path.join(source, name), destination)
+                print(f"{LOG} added preset '{name[:-5]}' to {target}")
+
     def post_ui_setup(self, components: dict) -> dict:
+        try:
+            self._install_presets()
+        except Exception:
+            traceback.print_exc()
         try:
             def create_tiles_dropdown():
                 config = _load_config()
