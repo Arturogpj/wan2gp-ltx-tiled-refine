@@ -35,6 +35,7 @@ Enable it and restart WanGP. The console shows:
 | Phases | **2** (fastest, recommended) or 1 (full 8 steps at full size, a little more natural, much slower) |
 | Steps | 8 |
 | Resolution | your target size, e.g. 1920x1088 or 2560x1408 |
+| Audio Postprocess | **Control Video Audio Track**. Keeps your clip's own audio; otherwise LTX writes a new soundtrack from the prompt, which drifts from the original and can drop words. The presets set this |
 | Frame rate | leave the model default (24 fps). The LoRA was trained on 24 fps; forcing 30 fps only repeats frames |
 | Prompt | a short description of the look, e.g. `sharp photographic detail, crisp natural texture, fine surface detail, clean edges, natural film grain, high resolution footage` |
 
@@ -118,6 +119,10 @@ LTX needs sizes divisible by 64, and WanGP rounds other values (2560x1440 become
 ]
 ```
 
+### Long clips (sliding windows)
+
+Clips longer than one window are refined in overlapping windows. WanGP sized every LTX window after the first from its control clip, which leaves out the overlap frames, so the second window came out 16 frames short and generation stopped there (a 669-frame clip ended 20 frames, 0.8 s, early; clips needing 3+ windows stopped after the second). The plugin holds the control clip's last frame so each window keeps its full length, then trims the held frames, so the result is exactly as long as your clip. This applies to every LTX control-video render, with or without the Refine LoRAs.
+
 ## How it works
 
 Ported from Lightricks' `TiledDiffusionModel` / `VideoModalityTilingHelper`:
@@ -132,6 +137,7 @@ It wraps, in WanGP's `models.ltx2`:
 - `ltx_pipelines.distilled.denoise_audio_video`: records the canvas size and phase.
 - `ltx_pipelines.distilled.simple_denoising_func`: swaps in the tiling transformer wrapper.
 - `ltx_pipelines.utils.helpers` control-video loading and VAE encoding: the low-VRAM path.
+- `shared.utils.utils.prepare_video_guide_and_mask`: the sliding-window length fix above (the LTX output is trimmed in `LTX2.generate`).
 
 ## Limitations
 
@@ -141,6 +147,7 @@ It wraps, in WanGP's `models.ltx2`:
 
 ## Changelog
 
+- **1.4.0** — long clips keep their full length (WanGP cut LTX sliding windows short and stopped after the second); presets keep the source clip's audio, and presets installed by older versions are switched to it on start. Works with WanGP's Oct 6 update (fixes `vae_encode_video() got an unexpected keyword argument 'device'`), and stands aside when WanGP's own phase 2 tiling is switched on.
 - **1.3.0** — ready-made Refine Details and Restore presets, installed into WanGP on first start.
 - **1.2.0** — Restore runs on its trained 960x544 windows (was 1024x576); Restore section in the README.
 - **1.1.0** — 2 Phases supported (one-window phase 1 draft), tile presets (Quality / Balanced / Fast) in the UI, low-VRAM control video for long clips, timing line, measured speeds.

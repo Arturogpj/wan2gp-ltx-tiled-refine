@@ -34,6 +34,7 @@ import dataclasses
 import json
 import math
 import os
+import sys
 import threading
 
 import torch
@@ -293,6 +294,70 @@ def _load_control_video_cpu(video_path, height, width, frame_cap, dtype, device)
     return torch.cat(parts, dim=2) if parts else None
 
 
+def _caller_locals(function_name):
+    frame = sys._getframe(2)
+    while frame is not None and frame.f_code.co_name != function_name:
+        frame = frame.f_back
+    return frame.f_locals if frame is not None else None
+
+
+def _hold_last_frame(tensor, frames, padding):
+    if tensor is None or not torch.is_tensor(tensor) or tensor.ndim < 2 or tensor.shape[1] != frames:
+        return tensor
+    return torch.cat([tensor, tensor[:, -1:].expand(-1, padding, *tensor.shape[2:])], dim=1)
+
+
+def _last_window_padding(video_guides, video_masks, pre_video_guide):
+    """WanGP shrinks a sliding window to the length of its control clip (and then stops generating), but LTX
+    control clips after the first window leave out the overlap frames (all but one). So the window came out
+    overlap - 1 frames short and every later window was skipped; on the last window up to 7 more frames were
+    dropped to reach a valid frame count (~20 frames, 0.8 s, lost at 24 fps on a two-window clip).
+    Hold the last control frame so WanGP keeps the right window length; frames past the end of the control
+    video are trimmed after generation. Returns padded (guides, masks), or None to leave WanGP unchanged."""
+    caller = _caller_locals("generate_media")
+    if caller is None or pre_video_guide is not None or "control_frames_offset" in caller:  # unknown WanGP or already fixed there
+        return None
+    if not (caller.get("control_video_trim") and caller.get("sliding_window") and caller.get("dont_cat_preguide")):
+        return None
+    if "ltx2" not in str(caller.get("base_model_type", "")):
+        return None
+    keep_frames, window_frames = caller.get("keep_frames_parsed"), caller.get("current_video_length")
+    latent_size, frame_offset = int(caller.get("latent_size", 8) or 8), int(caller.get("frames_offset", 1) or 1)
+    guide = video_guides[0] if video_guides else None
+    if keep_frames is None or window_frames is None or guide is None or not torch.is_tensor(guide):
+        return None
+    available = int(guide.shape[1])
+    uncovered = int(window_frames) - len(keep_frames)
+    if not 0 < available <= len(keep_frames) or uncovered <= 0 or uncovered % latent_size:
+        return None
+    needed = available + uncovered
+    valid = needed + (frame_offset - needed) % latent_size
+    if valid > window_frames:
+        return None
+    padding = valid - available
+    _state.trim_tail = valid - needed
+    _state.trim_fps = caller.get("fps")
+    if available < len(keep_frames):
+        print(f"{LOG} last window: control video ends after {available} frames; holding its last frame for {padding} more "
+              f"so the window keeps all of them ({_state.trim_tail} held frames trimmed from the output)")
+    return ([_hold_last_frame(t, available, padding) for t in video_guides],
+            [_hold_last_frame(t, available, padding) for t in video_masks])
+
+
+def _trim_tail(result):
+    tail, fps = getattr(_state, "trim_tail", 0), getattr(_state, "trim_fps", None)
+    _state.trim_tail = 0
+    if not tail or not isinstance(result, dict) or not torch.is_tensor(result.get("x")) or result["x"].shape[1] <= tail:
+        return result
+    result["x"] = result["x"][:, :-tail]
+    audio, rate = result.get("audio"), result.get("audio_sampling_rate")
+    if audio is not None and rate and fps:
+        cut = int(round(tail * rate / fps))
+        if 0 < cut < audio.shape[0]:
+            result["audio"] = audio[:-cut]
+    return result
+
+
 class _InputToDevice:
     """Encoder proxy: VAE tiles sliced from a system-RAM clip are moved to the GPU one at a time."""
 
@@ -321,6 +386,9 @@ def apply_patches():
         original_control_video = helpers.video_conditionings_by_control_video
         original_load_video = helpers.load_video_conditioning
         original_encode = helpers.vae_encode_video
+        from shared.utils import utils as wangp_utils
+
+        original_prepare = wangp_utils.prepare_video_guide_and_mask
 
         def video_conditionings_by_control_video(*args, **kwargs):
             # Every LTX control/IC-LoRA guide clip passes here; only inside it is the clip built in system RAM.
@@ -339,18 +407,36 @@ def apply_patches():
             return _load_control_video_cpu(kwargs["video_path"], kwargs["height"], kwargs["width"], kwargs.get("frame_cap"),
                                            kwargs["dtype"], device)
 
-        def vae_encode_video(video, video_encoder, tiling_config=None):
+        def vae_encode_video(video, video_encoder, tiling_config=None, *args, **kwargs):
             device = getattr(_state, "control_device", None)
-            if device is None or video.device.type != "cpu":
-                return original_encode(video, video_encoder, tiling_config)
+            # newer WanGP passes device= / dtype= and moves each tile to the GPU itself
+            if device is None or video.device.type != "cpu" or args or kwargs.get("device") is not None:
+                return original_encode(video, video_encoder, tiling_config, *args, **kwargs)
             if tiling_config is None or (tiling_config.spatial_config is None and tiling_config.temporal_config is None):
-                return original_encode(video.to(device), video_encoder, tiling_config)
-            return original_encode(video, _InputToDevice(video_encoder, device), tiling_config)
+                return original_encode(video.to(device), video_encoder, tiling_config, **kwargs)
+            return original_encode(video, _InputToDevice(video_encoder, device), tiling_config, **kwargs)
+
+        def prepare_video_guide_and_mask(video_guides, video_masks, pre_video_guide, *args, **kwargs):
+            _state.trim_tail = 0
+            try:
+                padded = _last_window_padding(video_guides, video_masks, pre_video_guide)
+            except Exception as error:  # never break a generation over this fix
+                print(f"{LOG} last window fix skipped: {error}")
+                padded = None
+            if padded is not None:
+                video_guides, video_masks = padded
+            return original_prepare(video_guides, video_masks, pre_video_guide, *args, **kwargs)
 
         def generate(self, *args, **kwargs):
+            return _trim_tail(tiled_generate(self, *args, **kwargs))
+
+        def tiled_generate(self, *args, **kwargs):
             lora = _tiled_lora(kwargs.get("loras_selected"))
             video_prompt_type = kwargs.get("video_prompt_type") or ""
             if args or lora is None or not ("V" in video_prompt_type and "G" in video_prompt_type) or kwargs.get("input_frames") is None:
+                return original_generate(self, *args, **kwargs)
+            if "~" in video_prompt_type:  # WanGP's own spatial tiling of phase 2 is on: don't tile the same canvas twice
+                print(f"{LOG} WanGP's own phase 2 tiling is on; LTX Tiled Refine stands aside for this render")
                 return original_generate(self, *args, **kwargs)
             if int(kwargs.get("guide_phases", 1) or 1) != 1:
                 if FORCE_ONE_PHASE:
@@ -423,6 +509,7 @@ def apply_patches():
         distilled.vae_decode_audio = _timed("audio decoding", distilled.vae_decode_audio)
         helpers.load_video_conditioning = load_video_conditioning
         helpers.vae_encode_video = vae_encode_video
+        wangp_utils.prepare_video_guide_and_mask = prepare_video_guide_and_mask  # wgp imports it at every window
         _patched = True
         config = _load_config()
         print(f"{LOG} Active: " + ", ".join(f"{pattern} on {long}x{short}" for pattern, (long, short) in TILE_WINDOWS.items()) + " fused windows "

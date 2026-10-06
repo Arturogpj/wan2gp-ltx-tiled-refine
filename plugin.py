@@ -44,7 +44,7 @@ class LTXTiledRefinePlugin(WAN2GPPlugin):
     def __init__(self):
         super().__init__()
         self.name = PlugIn_Name
-        self.version = "1.3.0"
+        self.version = "1.4.0"
         self.description = ("LTX-2.5 Refine Details / Restore IC-LoRAs: per-step tiled fusion on 1024x576 windows, "
                             "as in Lightricks' TiledFusion workflows.")
         self.request_component("guidance_phases")
@@ -66,9 +66,28 @@ class LTXTiledRefinePlugin(WAN2GPPlugin):
         os.makedirs(target, exist_ok=True)
         for name in sorted(os.listdir(source)):
             destination = os.path.join(target, name)
-            if name.endswith(".json") and not os.path.exists(destination):
+            if not name.endswith(".json"):
+                continue
+            if not os.path.exists(destination):
                 shutil.copyfile(os.path.join(source, name), destination)
                 print(f"{LOG} added preset '{name[:-5]}' to {target}")
+            else:
+                self._keep_source_audio(destination)
+
+    @staticmethod
+    def _keep_source_audio(path):
+        """Presets from 1.3.0 and older let LTX invent a new soundtrack; switch them to the source clip's own audio."""
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                settings = json.load(handle)
+            if settings.get("postprocess_audio", None) != "":
+                return
+            settings["postprocess_audio"] = "control"
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(settings, handle, indent=4)
+            print(f"{LOG} preset '{os.path.basename(path)[:-5]}' now keeps the source video's audio")
+        except Exception:
+            traceback.print_exc()
 
     def post_ui_setup(self, components: dict) -> dict:
         try:

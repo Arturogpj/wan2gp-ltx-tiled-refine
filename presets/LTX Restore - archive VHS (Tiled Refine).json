@@ -35,7 +35,7 @@
     "spatial_upsampler_reference_images": [],
     "spatial_upsampler_param": 1,
     "spatial_upsampler_param2": 1,
-    "postprocess_audio": "",
+    "postprocess_audio": "control",
     "NAG_scale": 1,
     "override_profile": -1,
     "override_attention": "",
