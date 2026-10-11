@@ -147,6 +147,7 @@ It wraps, in WanGP's `models.ltx2`:
 
 ## Changelog
 
+- **1.4.1** — fixes "Unsupported video input type: UInt8Guide" on WanGP 17.17+ with the low-VRAM control video option on: the plugin now only loads file paths itself and leaves WanGP's own chunked control clips alone. Thanks for the report!
 - **1.4.0** — long clips keep their full length (WanGP cut LTX sliding windows short and stopped after the second); presets keep the source clip's audio, and presets installed by older versions are switched to it on start. Works with WanGP's Oct 6 update (fixes `vae_encode_video() got an unexpected keyword argument 'device'`), and stands aside when WanGP's own phase 2 tiling is switched on.
 - **1.3.0** — ready-made Refine Details and Restore presets, installed into WanGP on first start.
 - **1.2.0** — Restore runs on its trained 960x544 windows (was 1024x576); Restore section in the README.

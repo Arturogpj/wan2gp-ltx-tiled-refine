@@ -402,7 +402,9 @@ def apply_patches():
 
         def load_video_conditioning(*args, **kwargs):
             device = getattr(_state, "control_device", None)
-            if device is None or args or torch.device(device).type != "cuda":
+            # Only file paths are loaded here. Newer WanGP (17.17+) passes tensors / UInt8Guide objects and already
+            # prepares them on the GPU by chunks and returns them in RAM, so those go straight to WanGP.
+            if device is None or args or torch.device(device).type != "cuda" or not isinstance(kwargs.get("video_path"), str):
                 return original_load_video(*args, **kwargs)
             return _load_control_video_cpu(kwargs["video_path"], kwargs["height"], kwargs["width"], kwargs.get("frame_cap"),
                                            kwargs["dtype"], device)
