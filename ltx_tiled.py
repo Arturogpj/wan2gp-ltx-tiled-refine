@@ -371,6 +371,9 @@ class _InputToDevice:
         return self._encoder(tile.to(self._device, non_blocking=True), *args, **kwargs)
 
 
+from .nad_chunks import find_pixel_cuts, wrap_decode as wrap_nad_decode
+
+
 def apply_patches():
     global _patched
     with _lock:
@@ -420,6 +423,13 @@ def apply_patches():
 
         def prepare_video_guide_and_mask(video_guides, video_masks, pre_video_guide, *args, **kwargs):
             _state.trim_tail = 0
+            _state.pixel_cuts = None
+            try:  # camera cuts in this window's control clip, for the NAD decoder's long-clip pieces
+                guide = video_guides[0] if video_guides else None
+                if pre_video_guide is None and torch.is_tensor(guide):
+                    _state.pixel_cuts = find_pixel_cuts(guide)
+            except Exception as error:
+                print(f"{LOG} cut detection skipped: {error}")
             try:
                 padded = _last_window_padding(video_guides, video_masks, pre_video_guide)
             except Exception as error:  # never break a generation over this fix
@@ -507,7 +517,7 @@ def apply_patches():
             module.video_conditionings_by_control_video = timed_control_video
         distilled.denoise_audio_video = _timed("denoise", denoise_audio_video)
         distilled.upsample_video = _timed("phase 1->2 upscale", distilled.upsample_video)
-        distilled.vae_decode_video_to_tensor = _timed("video decoding", distilled.vae_decode_video_to_tensor)
+        distilled.vae_decode_video_to_tensor = _timed("video decoding", wrap_nad_decode(distilled.vae_decode_video_to_tensor, lambda: getattr(_state, "pixel_cuts", None)))
         distilled.vae_decode_audio = _timed("audio decoding", distilled.vae_decode_audio)
         helpers.load_video_conditioning = load_video_conditioning
         helpers.vae_encode_video = vae_encode_video

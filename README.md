@@ -41,6 +41,10 @@ Enable it and restart WanGP. The console shows:
 
 The plugin only activates when a LoRA whose file name contains `ic-lora-refine-details` or `ic-lora-restore` is selected **and** an IC-LoRA control video is used. Everything else runs as normal WanGP.
 
+### Less ghosting: use the NAD decoder
+
+In the LTX-2 2.5 model settings, set the **VAE** option to **NAD Diffusion Decoder (slower, higher VRAM, better motion)**. In our tests it removed most of the ghosting and warping on moving people and objects that the default decoder leaves after a refine (about 15% slower). Long clips are decoded in pieces automatically (see 1.5.0 below), so it also works for 20 s clips at 2K on 16 GB.
+
 ### Ready-made presets
 
 On first start the plugin adds two presets to WanGP's LTX-2 presets list (they show up after the next restart; existing files with the same name are never overwritten):
@@ -147,6 +151,7 @@ It wraps, in WanGP's `models.ltx2`:
 
 ## Changelog
 
+- **1.5.0** — long clips with the **NAD Diffusion Decoder** no longer run out of memory at the very end. NAD decodes the whole clip at once (20 s at 2K needs far more than 16 GB), so the plugin now decodes it in pieces that fit, split at the clip's camera cuts (found automatically) so no seam can show, with soft cross-fades inside long shots. Short clips are decoded as before.
 - **1.4.1** — fixes "Unsupported video input type: UInt8Guide" on WanGP 17.17+ with the low-VRAM control video option on: the plugin now only loads file paths itself and leaves WanGP's own chunked control clips alone. Thanks for the report!
 - **1.4.0** — long clips keep their full length (WanGP cut LTX sliding windows short and stopped after the second); presets keep the source clip's audio, and presets installed by older versions are switched to it on start. Works with WanGP's Oct 6 update (fixes `vae_encode_video() got an unexpected keyword argument 'device'`), and stands aside when WanGP's own phase 2 tiling is switched on.
 - **1.3.0** — ready-made Refine Details and Restore presets, installed into WanGP on first start.
